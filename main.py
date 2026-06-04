@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 智能防误关麦助手 (Smart Mic Guardian)
 适用于 Windows 10 / Windows 11
@@ -7,12 +5,15 @@
 功能说明：
 - 实时读取系统麦克风静音状态
 - 提供静音 / 开麦的基础控制接口
-- 通过语音识别检测用户是否正在说话，防止误关麦克风
+- VAD 短时能量算法人声检测（PyAudio）
+- 连续静音 15s + 15s 延时等待后弹窗提醒
+- 手动关麦即时检测并弹窗提醒
 - 通过桌面通知提示当前麦克风状态变化
 
 依赖库：
 - pycaw: Windows Core Audio 控制
-- speech_recognition: 语音活动检测
+- pyaudio: 实时音频流式采集（VAD 算法）
+- speech_recognition: 语音活动检测（备用）
 - plyer: 系统桌面通知
 """
 
@@ -42,12 +43,26 @@ except ImportError as e:
     print(f"[警告] 缺少通知库 plyer: {e}")
     notification = None
 
-# 语音识别库
+# 语音识别库（备用）
 try:
     import speech_recognition as sr
 except ImportError as e:
     print(f"[警告] 缺少语音识别库 SpeechRecognition: {e}")
     sr = None
+
+# 防误关麦守护主控模块（VAD + 延时等待 + 弹窗 + ASR + NLP）
+try:
+    from guardian import MicGuardian
+except ImportError as e:
+    print(f"[警告] 无法加载 guardian 模块: {e}")
+    MicGuardian = None
+
+# NLP 意图规则库（供 CLI 展示）
+try:
+    from nlp import IntentMatcher
+except ImportError as e:
+    print(f"[警告] 无法加载 nlp 模块: {e}")
+    IntentMatcher = None
 
 
 class MicController:
@@ -267,19 +282,25 @@ class SpeechGuardian:
 
 def print_help() -> None:
     """打印使用说明"""
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 54)
     print("  智能防误关麦助手 - 交互命令说明")
-    print("=" * 50)
+    print("=" * 54)
     print("  s / status   - 查看当前麦克风状态")
     print("  m / mute     - 静音麦克风")
     print("  u / unmute   - 开启麦克风")
     print("  t / toggle   - 切换静音/开麦状态")
     print("  v <数值>     - 设置麦克风音量 (0-100)")
     print("  l / listen   - 实时监听麦克风音量峰值")
-    print("  g / guard    - 启动/停止防误关麦守护")
+    print("  g / guard    - 启动/停止 VAD 防误关麦守护")
+    print("                (3s 底噪校准 → 15s 静音 + 15s 延时")
+    print("                → ASR 识别 → NLP 意图判断 → 弹窗)")
+    print("  i / intent   - 查看最近一次 NLP 意图识别结果")
+    print("  r / rules    - 查看 NLP 关键词规则库")
+    print("  a / asr      - 手动触发一次 ASR+NLP 识别（截近 3s）")
+    print("  p / predict  - 查看发言预测与关麦屏蔽动态状态")
     print("  h / help     - 显示帮助信息")
     print("  q / quit     - 退出程序")
-    print("=" * 50 + "\n")
+    print("=" * 54 + "\n")
 
 
 def main() -> None:
@@ -295,13 +316,24 @@ def main() -> None:
     except Exception:
         sys.exit(1)
 
-    # 初始化语音守护器
-    guardian = SpeechGuardian(mic)
+    # 初始化 VAD 防误关麦守护器
+    vad_guardian: Optional[MicGuardian] = None
+    if MicGuardian is not None:
+        try:
+            vad_guardian = MicGuardian()
+        except Exception as e:
+            print(f"[警告] VAD 守护器初始化失败: {e}")
 
     # 显示初始状态
     status_text = "静音" if mic.is_muted() else "开麦"
     print(f"[初始化] 麦克风当前状态: {status_text}")
     print(f"[初始化] 麦克风当前音量: {mic.get_volume_percent()}%")
+    if vad_guardian is not None:
+        from asr import OfflineASR as _ASR
+        _asr_check = _ASR()
+        asr_status = "就绪" if _asr_check.available else "不可用（未安装vosk或缺少模型，仍可弹窗）"
+        print(f"[初始化] VAD 守护器就绪（输入 g 启动）")
+        print(f"[初始化] 离线 ASR 状态: {asr_status}")
     print_help()
 
     # 交互式命令循环
@@ -374,16 +406,76 @@ def main() -> None:
             print("[监听] 已停止")
 
         elif action in ("g", "guard"):
-            if guardian._running:
-                guardian.stop_guard()
+            if vad_guardian is None:
+                print("[错误] VAD 守护模块不可用，无法启动")
+                continue
+            if vad_guardian.is_running:
+                vad_guardian.stop()
             else:
-                guardian.start_guard()
+                # 在新线程中启动（底噪校准会阻塞几秒，避免卡住主循环）
+                t = threading.Thread(target=vad_guardian.start, daemon=True)
+                t.start()
+
+        elif action in ("i", "intent"):
+            if vad_guardian is None or vad_guardian.last_intent is None:
+                print("[意图] 暂无识别结果，请先启动守护(g)并完成一次弹窗流程")
+            else:
+                intent = vad_guardian.last_intent
+                print(f"\n[意图] 最近识别结果:")
+                print(f"  原始文本: {intent['raw_text']}")
+                print(f"  命中意图: {intent['intent']} ({intent['label']})")
+                print(f"  匹配关键词: {intent['matched_keyword']}")
+                print(f"  相似度: {intent['score']}")
+                print(f"  执行动作: {intent['action']}")
+                print()
+
+        elif action in ("r", "rules"):
+            if IntentMatcher is None:
+                print("[错误] NLP 模块不可用")
+                continue
+            matcher = IntentMatcher()
+            print("\n[规则库] 当前 NLP 关键词规则:")
+            for rule in matcher.rules:
+                intent = rule.get("intent", "")
+                label = rule.get("label", "")
+                action_str = rule.get("action", "")
+                keywords = rule.get("keywords", [])
+                print(f"\n  [{intent}] {label} (动作: {action_str})")
+                for kw in keywords:
+                    print(f"    - {kw}")
+            print()
+
+        elif action in ("a", "asr"):
+            if vad_guardian is None or not vad_guardian.is_running:
+                print("[错误] 守护线程未运行，无法截取音频。请先输入 g 启动")
+                continue
+            print("[ASR] 手动触发近 3 秒音频识别 + NLP 意图匹配...")
+            vad_guardian._run_asr_nlp_pipeline()
+
+        elif action in ("p", "predict"):
+            if vad_guardian is None or not vad_guardian.is_running:
+                print("[错误] 守护线程未运行。请先输入 g 启动")
+                continue
+            ps = vad_guardian.pre_speech_status
+            bs = vad_guardian.block_status
+            print(f"\n[发言预测] 当前状态:")
+            print(f"  预发声音频: {ps['pre_voice']}")
+            print(f"  语义铺垫:   {ps['semantic_ready']}")
+            print(f"  综合判定:   {'建议清零计时器' if ps['should_reset'] else '未命中'}")
+            print(f"  详情:       {ps['status_str']}")
+            print(f"\n[关麦屏蔽] 当前状态:")
+            print(f"  主动下线:   {bs['stop_remind']}")
+            print(f"  屏蔽弹窗:   {bs['block_alert']}")
+            print(f"  关麦标记:   {bs['mic_off_flag']}")
+            print(f"  此前人声:   {bs['had_voice_before_off']}")
+            print()
 
         else:
             print(f"[未知命令] '{cmd}'，输入 h 查看帮助")
 
     # 清理资源
-    guardian.stop_guard()
+    if vad_guardian is not None and vad_guardian.is_running:
+        vad_guardian.stop()
     print("[结束] 感谢使用智能防误关麦助手！")
 
 

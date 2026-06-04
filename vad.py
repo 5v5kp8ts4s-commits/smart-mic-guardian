@@ -10,6 +10,7 @@ vad.py - 人声检测模块（VAD 短时能量算法）
 import sys
 import struct
 import math
+from collections import deque
 
 # 平台检查
 if sys.platform != "win32":
@@ -33,6 +34,9 @@ DEFAULT_ENERGY = 500.0     # 校准失败时的默认阈值
 
 # 手动关麦判定：连续多少帧全为 0 视为物理关麦
 MIC_OFF_FRAMES = 10
+
+# 音频滚动缓冲区时长（秒），需 >= ASR 截取需求
+AUDIO_BUFFER_SECS = 5
 
 
 def _compute_energy(frame_bytes: bytes) -> float:
@@ -69,6 +73,10 @@ class VADDetector:
         self._threshold: float = DEFAULT_ENERGY
         self._mic_off_count: int = 0  # 连续全零帧计数
         self.calibrated: bool = False
+
+        # 音频滚动缓冲区：保存最近 AUDIO_BUFFER_SECS 秒的原始 PCM 帧
+        max_frames = int(AUDIO_BUFFER_SECS / FRAME_DURATION)
+        self._audio_buffer: deque[bytes] = deque(maxlen=max_frames)
 
     # ------------------------------------------------------------------
     # 底噪校准
@@ -144,6 +152,9 @@ class VADDetector:
             print(f"[VAD 警告] 读取音频帧失败: {e}")
             return "silence", 0.0
 
+        # 写入滚动缓冲区
+        self._audio_buffer.append(data)
+
         # --- 手动关麦检测：连续 MIC_OFF_FRAMES 帧全零 ---
         if _is_all_zero(data):
             self._mic_off_count += 1
@@ -171,6 +182,16 @@ class VADDetector:
     def frame_duration(self) -> float:
         """单帧时长（秒），用于外部累加计时"""
         return FRAME_DURATION
+
+    def get_recent_pcm(self, duration_secs: float = 3.0) -> bytes:
+        """
+        从滚动缓冲区截取最近 duration_secs 秒的 PCM 数据。
+        :param duration_secs: 截取时长，默认 3 秒
+        :return: 原始 PCM 字节流
+        """
+        frames_needed = int(duration_secs / FRAME_DURATION)
+        recent = list(self._audio_buffer)[-frames_needed:]
+        return b"".join(recent)
 
     # ------------------------------------------------------------------
     # 内部辅助
