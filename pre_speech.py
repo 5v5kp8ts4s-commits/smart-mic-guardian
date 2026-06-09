@@ -1,12 +1,13 @@
 """
-pre_speech.py - 发言预测模块
+pre_speech.py - 发言预测模块（v4.3）
 
 功能：
 1. 音频滑动窗口（近 2s）实时提取预发声特征
    - 能量介于「底噪阈值 ~ 人声阈值」区间 → 判定预发声
+   - 窗口后半段能量必须明显高于前半段（上升斜率，过滤静止噪音）
 2. 语义历史预判
-   - 上一轮 NLP 命中铺垫/提问类意图（action=mark_ready）→ 标记即将发言
-3. 任一条件命中 → 建议调用方清零静音计时器
+
+v4.3 修复：添加能量上升斜率检查，解决安静环境下静止噪音持续误触发问题。
 """
 
 import struct
@@ -14,32 +15,27 @@ import time
 from collections import deque
 from typing import Optional
 
-
-# ========== 预测配置 ==========
-WINDOW_SECS     = 2.0   # 滑动窗口时长（秒）
-# 预发声能量倍率区间（相对底噪阈值）
-# 能量 ∈ (noise_threshold * LOWER_RATIO, noise_threshold * UPPER_RATIO)
-PRE_VOICE_LOWER = 1.05  # 略高于底噪
-PRE_VOICE_UPPER = 2.5   # 但低于正常人声（实际人声通常 > 3x 底噪）
-
-# NLP 铺垫类意图的 action 值
-FORESHADOW_ACTION = "mark_ready"
-
-# 语义历史有效期（秒）：铺垫意图识别后，多久内视为"即将发言"状态
-SEMANTIC_VALID_SECS = 30.0
-
+# 统一从 config 引入参数
+from config import (
+    PRE_SPEECH_BUFFER_SECS as WINDOW_SECS,
+    PRE_VOICE_LOWER_RATIO as PRE_VOICE_LOWER,
+    PRE_VOICE_UPPER_RATIO as PRE_VOICE_UPPER,
+    PRE_VOICE_MIN_FILL_RATIO,
+    PRE_VOICE_HIT_RATIO,
+    PRE_VOICE_RISING_RATIO,
+    PRE_SPEECH_COOLDOWN_S,
+    FRAME_DURATION as _DEFAULT_FRAME_DURATION,
+)
 
 class PreSpeechDetector:
     """
     发言预测检测器
 
-    维护近 2s 音频能量滑动窗口 + NLP 语义历史标记，
+    维护近 2s 音频能量滑动窗口，
     判断用户是否处于「即将开口」状态。
 
     状态属性：
       - is_pre_voice: 音频特征判定为预发声
-      - is_semantic_ready: NLP 历史语义判定即将发言
-      - should_reset: 任一条件命中，建议清零计时器
     """
 
     def __init__(self, noise_threshold: float, voice_threshold: float,
@@ -58,11 +54,12 @@ class PreSpeechDetector:
         self._energy_window: deque[float] = deque(maxlen=max_frames)
 
         # 语义历史标记：记录上次 mark_ready 命中的时间戳（time.monotonic）
-        self._semantic_marked_at: Optional[float] = None
 
         # 对外暴露的状态
         self._is_pre_voice = False
-        self._is_semantic_ready = False
+
+        # 发言预测触发后的冷却计时（避免连续误触发）
+        self._last_trigger_at: Optional[float] = None
 
     # ------------------------------------------------------------------
     # 更新接口（每帧调用）
@@ -75,42 +72,34 @@ class PreSpeechDetector:
         self._energy_window.append(energy)
         self._is_pre_voice = self._check_pre_voice()
 
-    def update_nlp(self, intent_result: Optional[dict]) -> None:
-        """
-        提供最新 NLP 意图匹配结果，更新语义历史标记。
-        :param intent_result: IntentMatcher.match() 的返回值
-        """
-        if intent_result and intent_result.get("action") == FORESHADOW_ACTION:
-            import time
-            self._semantic_marked_at = time.monotonic()
-            print(f"[PreSpeech] NLP 铺垫意图命中 "
-                  f"({intent_result.get('matched_keyword')})，标记即将发言状态")
-        self._refresh_semantic_ready()
-
     # ------------------------------------------------------------------
     # 周期性刷新语义状态（可在主循环每帧调用）
     # ------------------------------------------------------------------
     def tick(self) -> None:
         """刷新语义有效期判断，超时自动失效。"""
-        self._refresh_semantic_ready()
+        pass
 
     # ------------------------------------------------------------------
     # 状态属性
     # ------------------------------------------------------------------
     @property
     def is_pre_voice(self) -> bool:
-        """音频特征命中预发声区间"""
+        """音频特征命中预发声区间（含冷却期检查）"""
+        if not self._is_pre_voice:
+            return False
+        # 冷却期：触发后 8 秒内即使条件满足也返回 False，避免连续弹窗
+        if self._last_trigger_at is not None:
+            elapsed = time.monotonic() - self._last_trigger_at
+            if elapsed < PRE_SPEECH_COOLDOWN_S:
+                return False
         return self._is_pre_voice
 
     @property
-    def is_semantic_ready(self) -> bool:
-        """NLP 语义历史标记为即将发言"""
-        return self._is_semantic_ready
 
     @property
     def should_reset(self) -> bool:
         """任一预测条件命中 → 建议清零静音计时器"""
-        return self._is_pre_voice or self._is_semantic_ready
+        return self._is_pre_voice
 
     @property
     def status_str(self) -> str:
@@ -118,35 +107,62 @@ class PreSpeechDetector:
         parts = []
         if self._is_pre_voice:
             parts.append("预发声音频")
-        if self._is_semantic_ready:
-            parts.append("语义历史铺垫")
         return "、".join(parts) if parts else "无"
 
-    def reset_semantic(self) -> None:
-        """手动清除语义历史标记（重置计时器后调用，避免重复触发）"""
-        self._semantic_marked_at = None
-        self._is_semantic_ready = False
+    def reset(self) -> None:
+        """完全重置：清空能量窗口、语义标记和所有状态（麦克风休眠后恢复时调用）"""
+        self._energy_window.clear()
+        self._is_pre_voice = False
+        self._last_trigger_at = None
 
     # ------------------------------------------------------------------
     # 内部计算
     # ------------------------------------------------------------------
     def _check_pre_voice(self) -> bool:
         """
-        判断滑动窗口内平均能量是否落入预发声区间：
-        底噪阈值 * LOWER_RATIO < 均值 < 底噪阈值 * UPPER_RATIO
-        （高于底噪但低于正常人声，对应吸气、轻微唇噪等）
+        判断滑动窗口内是否有足够比例的帧落入预发声区间，且能量呈上升趋势。
+
+        算法演进：
+        - v4.0：看窗口内平均能量是否在区间 → 底噪轻微抬高就误触发
+        - v4.2：统计单帧命中区间占比 + 窗口填充率检查 → 仍被静止噪音命中
+        - v4.3：新增「能量上升斜率」检查，真正的 pre-voice 是气息渐强，
+                静止噪音（风扇/空调）能量分布均匀，不会持续上升。
+
+        需同时满足：
+        1. 窗口已填充 >= PRE_VOICE_MIN_FILL_RATIO
+        2. 落在 [lower, upper) 区间的帧占比 >= PRE_VOICE_HIT_RATIO
+        3. 窗口后半段平均能量 >= 前半段 × PRE_VOICE_RISING_RATIO（上升趋势）
         """
         if not self._energy_window:
             return False
-        avg_energy = sum(self._energy_window) / len(self._energy_window)
+
+        max_frames = self._energy_window.maxlen or 1
+        fill_ratio = len(self._energy_window) / max_frames
+
+        # 条件 1：窗口填充率
+        if fill_ratio < PRE_VOICE_MIN_FILL_RATIO:
+            return False
+
         lower = self._noise_threshold * PRE_VOICE_LOWER
         upper = self._noise_threshold * PRE_VOICE_UPPER
-        return lower < avg_energy < upper
 
-    def _refresh_semantic_ready(self) -> None:
-        """检查语义标记是否仍在有效期内"""
-        if self._semantic_marked_at is None:
-            self._is_semantic_ready = False
-            return
-        elapsed = time.monotonic() - self._semantic_marked_at
-        self._is_semantic_ready = elapsed <= SEMANTIC_VALID_SECS
+        # 条件 2：预发声区间命中占比
+        hit_frames = sum(1 for e in self._energy_window if lower < e < upper)
+        hit_ratio = hit_frames / len(self._energy_window)
+        if hit_ratio < PRE_VOICE_HIT_RATIO:
+            return False
+
+        # 条件 3：能量上升斜率（核心改进：过滤静止噪音）
+        # 将窗口分为前半段和后半段，比较平均能量
+        window = list(self._energy_window)
+        mid = len(window) // 2
+        if mid == 0:
+            return False
+        first_half_avg = sum(window[:mid]) / mid
+        second_half_avg = sum(window[mid:]) / (len(window) - mid)
+        # 后半段必须明显高于前半段（气息渐强特征）
+        if second_half_avg < first_half_avg * PRE_VOICE_RISING_RATIO:
+            return False
+
+        return True
+

@@ -9,7 +9,6 @@ vad.py - 人声检测模块（VAD 短时能量算法）
 
 import sys
 import struct
-import math
 from collections import deque
 
 # 平台检查
@@ -23,20 +22,12 @@ except ImportError:
     print("[VAD 错误] 缺少 PyAudio，请执行: pip install pyaudio")
     sys.exit(1)
 
-
-# ========== VAD 配置常量 ==========
-SAMPLE_RATE    = 16000     # 采样率（Hz）
-FRAME_DURATION = 0.03      # 单帧时长（秒）
-FRAME_SIZE     = int(SAMPLE_RATE * FRAME_DURATION)  # 单帧采样点数
-CALIBRATE_SECS = 3         # 底噪校准时长（秒）
-NOISE_FACTOR   = 3.0       # 动态阈值 = 底噪均值 × NOISE_FACTOR
-DEFAULT_ENERGY = 500.0     # 校准失败时的默认阈值
-
-# 手动关麦判定：连续多少帧全为 0 视为物理关麦
-MIC_OFF_FRAMES = 10
-
-# 音频滚动缓冲区时长（秒），需 >= ASR 截取需求
-AUDIO_BUFFER_SECS = 5
+# 统一从 config 引入所有音频参数
+from config import (
+    SAMPLE_RATE, FRAME_DURATION, FRAME_SIZE,
+    CALIBRATE_SECS, NOISE_FACTOR, DEFAULT_ENERGY,
+    MIC_OFF_FRAMES, AUDIO_BUFFER_SECS, ASR_CAPTURE_SECS,
+)
 
 
 def _compute_energy(frame_bytes: bytes) -> float:
@@ -196,11 +187,51 @@ class VADDetector:
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
+    def _get_input_device_index(self) -> int:
+        """
+        获取可用输入设备的索引。
+        先尝试默认输入设备，失败则遍历所有设备找第一个有输入通道的设备。
+        :return: 设备索引号
+        :raises RuntimeError: 找不到任何可用输入设备
+        """
+        # 尝试获取默认输入设备
+        try:
+            info = self._pa.get_default_input_device_info()
+            idx = info.get("index")
+            if idx is not None:
+                return int(idx)
+        except Exception:
+            pass
+
+        # 默认失败，遍历所有设备
+        device_count = self._pa.get_device_count()
+        for i in range(device_count):
+            try:
+                info = self._pa.get_device_info_by_index(i)
+                max_input = info.get("maxInputChannels", 0)
+                if max_input and int(max_input) > 0:
+                    print(f"[VAD] 使用音频输入设备: {info.get('name', 'Unknown')} (index={i})")
+                    return i
+            except Exception:
+                continue
+
+        raise RuntimeError(
+            "[VAD 错误] 未找到可用音频输入设备。\n"
+            "  可能原因：\n"
+            "  1. 未连接麦克风（请插入 USB/耳机麦克风）\n"
+            "  2. 麦克风被其他程序独占（请关闭 Teams/Zoom/腾讯会议等）\n"
+            "  3. 系统隐私设置未允许应用访问麦克风\n"
+            "  4. Anaconda 环境 PyAudio 与系统音频驱动不兼容（尝试 pip uninstall pyaudio 后 pip install pipwin && pipwin install pyaudio）"
+        )
+
     def _open_stream(self) -> pyaudio.Stream:
+        """打开麦克风音频流，自动检测可用设备"""
+        device_index = self._get_input_device_index()
         return self._pa.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=SAMPLE_RATE,
             input=True,
+            input_device_index=device_index,
             frames_per_buffer=FRAME_SIZE,
         )

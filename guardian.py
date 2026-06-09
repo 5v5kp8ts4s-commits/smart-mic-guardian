@@ -1,12 +1,13 @@
 """
-guardian.py - 防误关麦守护主控模块
+guardian.py - 防误关麦守护主控模块 (v5.0)
 
-功能：
-- 整合 VAD 人声检测、静默计时、15 秒延时等待、弹窗提醒
-- 区分「环境静音」与「手动关麦」两种场景
-- 弹窗触发后：截取静音前 3s 音频 → 离线 ASR → NLP 意图匹配 → 智能调整提醒策略
-- 全局状态变量通过线程锁保护，支持多线程安全访问
-- 集成全链路异常捕获，确保长时间稳定运行
+功能（v5.0 重构）：
+- 核心逻辑从「检测静默提醒关麦」改为「检测非会议闲聊提醒关麦」
+- 开场 3 分钟自动构建会议话题白名单（高频专业词）
+- 实时 ASR 语音识别 → 话题分类（MEETING / CHITCHAT / NEUTRAL）
+- 声学特征辅助：区分「近距离开麦发言」vs「扭头小声闲聊」
+- 连续 3 秒闲聊才弹窗提醒，偶发插话不触发
+- 全链路异常捕获 + 线程锁保护
 """
 
 import sys
@@ -21,28 +22,41 @@ if sys.platform != "win32":
 from vad import VADDetector
 from alert import show_silent_alert, show_mic_off_alert
 from asr import OfflineASR
-from nlp import IntentMatcher
 from pre_speech import PreSpeechDetector
 from error_handler import (
     handle_audio_frame_error, handle_asr_error,
-    check_memory_usage, get_error_log, install_global_handler,
+    get_error_log, install_global_handler,
 )
 from config import (
     SILENT_THRESHOLD_S, DELAY_WAIT_S, ASR_CAPTURE_SECS,
-    SAMPLE_RATE, STRESS_LOG_INTERVAL_S,MAX_FRAME_ERRORS,
+    SAMPLE_RATE, FRAME_DURATION, MAX_FRAME_ERRORS,
+    VOICE_VERIFY_SECS, MIN_VOICE_TEXT_LEN, VOICE_VERIFY_ENABLED,
+    CHITCHAT_ALERT_SECS, CHITCHAT_RESET_SECS, SILENT_ALERT_SECS,
+    TOPIC_CALIBRATE_SECS, ACOUSTIC_CALIBRATE_FRAMES,
+    MEETING_MODE_DURATION_SECS,
+    SYSTEM_AUDIO_ENABLED, SYSTEM_ASR_INTERVAL_SECS,
+    SYSTEM_AUDIO_BUFFER_SECS,
 )
+from session_topic import SessionTopicManager, ContentType
+from session_calibrator import SessionCalibrator
+from system_audio import SystemAudioCapturer
+from system_asr import SystemASRProcessor, MeetingState
 
 
 class MicGuardian:
     """
-    麦克风防误关守护器
+    麦克风防误关守护器 (v5.0)
 
-    核心状态机：
-      监听中 → 静音帧累加 silent_time
-            → 人声帧 → silent_time = 0，wait_flag = False，delay_cnt = 0
-            → silent_time >= 15 → 进入延时等待（wait_flag = True, delay_cnt = 15）
-            → delay_cnt <= 0 → 弹窗提醒
-            → mic_off 帧 → 立即弹窗（不走计时）
+    核心状态机（v5.0 重构）：
+      ① 开场校准（3 分钟白名单采集 + 声学基线，两者并行）
+      ② 实时监听 → VAD 检测到 voice → ASR 语音验证 → topic 分类
+      ③ 分类结果：
+         MEETING   → 重置闲聊计时，不提醒
+         CHITCHAT  → 累加闲聊计时，>= CHITCHAT_ALERT_SECS 弹窗提醒
+         NEUTRAL   → 不重置也不累加（在听别人说话）
+      ④ 声学辅助：近麦稳定发言 vs 偏移闲聊的 CV 评估
+      ⑤ 连续非闲聊 >= CHITCHAT_RESET_SECS → 重置闲聊计时
+      ⑥ mic_off 帧 → 即时弹窗（不走闲聊计时）
     """
 
     def __init__(self):
@@ -50,71 +64,137 @@ class MicGuardian:
         self._thread: Optional[threading.Thread] = None
         self._running = False
 
-        # ASR / NLP 组件
-        self._asr = OfflineASR(sample_rate=self._vad.SAMPLE_RATE if hasattr(self._vad, 'SAMPLE_RATE') else 16000)
-        self._nlp = IntentMatcher()
+        self._asr = OfflineASR(sample_rate=16000)
 
-        # 发言预测模块（在校准后初始化）
+        # v5.0 新增：话题白名单管理器 + 声学校准器
+        self._topic_mgr = SessionTopicManager()
+        self._calibrator = SessionCalibrator()
+
+        # 发言预测模块（在底噪校准后初始化）
         self._pre_speech: Optional[PreSpeechDetector] = None
 
-        # 计时器状态（由 _listen_loop 内部维护）
-        self.silent_time: float = 0.0      # 累计静音时长
-        self.wait_flag: bool = False       # 是否处于延时等待中
-        self.delay_cnt: float = 0.0        # 延时倒计时
-        self._mic_off_flag: bool = False   # 是否触发过关麦弹窗
-        self._stop_remind: bool = False    # NLP 判定用户主动下线，停止弹窗
-        self._last_intent: Optional[dict] = None  # 上次识别的意图结果
+        # ---- v4.x 兼容：旧静默计时状态 ----
+        self.silent_time: float = 0.0
+        self.wait_flag: bool = False
+        self.delay_cnt: float = 0.0
 
-        # 人声历史追踪（用于区分误关麦 vs 主动关麦）
-        # 连续检测到 voice 的帧数（关麦前如有语音记录 → 误关麦）
+        # ---- v5.0 新增：闲聊计时器 ----
+        self._chitchat_timer: float = 0.0      # 连续闲聊累计秒数
+        self._chitchat_alerted: bool = False   # 是否已触发弹窗（防重复）
+        self._last_chitchat_text: str = ""     # 最近一次命中的闲聊文本
+        self._non_chitchat_timer: float = 0.0  # 连续非闲聊秒数
+
+        # ---- v5.2 新增：安静计时器（麦克风开启但无有效输入） ----
+        self._silent_timer: float = 0.0        # 安静累计秒数（NEUTRAL / silence 累加）
+        self._silent_alerted: bool = False     # 是否已触发安静弹窗
+
+        # ---- v5.3 新增：系统音频捕获 + 会议状态检测 ----
+        self._sys_audio: Optional[SystemAudioCapturer] = None
+        self._sys_asr: Optional[SystemASRProcessor] = None
+        self._sys_asr_last_time: float = 0.0   # 上次系统音频 ASR 处理时间戳
+        self._sys_audio_enabled: bool = SYSTEM_AUDIO_ENABLED
+
+        # ---- 最近一次话题分类结果（供 UI 查询）----
+        self._last_content_type: Optional[ContentType] = None
+        self._last_classify_detail: Optional[dict] = None
+
+        # ---- 弹窗与屏蔽 ----
+        self._mic_off_flag: bool = False
+        self._stop_remind: bool = False
+
+        # 人声历史追踪（区分误关麦 vs 主动关麦）
         self._voice_streak: int = 0
-        # 麦克风关闭前是否有显著人声记录
         self._had_voice_before_off: bool = False
 
-        # 线程锁：保护全局状态变量的并发读写
-        self._state_lock = threading.Lock()
+        # ---- ASR 语音验证窗口（噪音过滤） ----
+        self._voice_verify_enabled: bool = VOICE_VERIFY_ENABLED
+        self._verify_buffer = []
+        self._verify_frames_needed: int = max(1, int(VOICE_VERIFY_SECS / FRAME_DURATION))
+        self._in_verify_window: bool = False
+        self._voice_confirmed: bool = False
 
-        # 帧错误计数：连续出错超过 MAX_FRAME_ERRORS 则重置音频流
+        # 线程锁
+        self._state_lock = threading.Lock()
         self._frame_error_count: int = 0
 
-        # 安装全局未捕获异常处理器
         install_global_handler()
 
     # ------------------------------------------------------------------
     # 启动 / 停止
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """启动守护监听（阻塞式校准 + 后台线程监听）"""
+        """启动守护监听"""
         if self._running:
             print("[Guardian] 守护线程已在运行")
             return
 
-        # 重置状态标记（线程锁保护）
         with self._state_lock:
             self._stop_remind = False
-            self._last_intent = None
             self._voice_streak = 0
             self._had_voice_before_off = False
             self._frame_error_count = 0
+            self._chitchat_timer = 0.0
+            self._chitchat_alerted = False
+            self._non_chitchat_timer = 0.0
+            self._silent_timer = 0.0
+            self._silent_alerted = False
+            self._last_content_type = None
+            self._sys_asr_last_time = 0.0
 
-        # 校准底噪（必须在主线程或同一线程中完成）
-        self._vad.calibrate(duration=3.0)
+        try:
+            # ① VAD 底噪校准（3s）
+            self._vad.calibrate(duration=3.0)
+        except RuntimeError as e:
+            # 麦克风设备不可用（PyAudio -9996 等）
+            print(f"\n{str(e)}")
+            print("[Guardian] 守护启动失败：音频输入设备不可用，请检查麦克风后重试。")
+            self._vad = VADDetector()  # 重建 VAD 以便下次重试
+            return
+        except OSError as e:
+            print(f"\n[Guardian 错误] 音频设备异常: {e}")
+            print("[Guardian] 守护启动失败，请检查麦克风连接和隐私设置后重试。")
+            self._vad = VADDetector()
+            return
 
-        # 初始化发言预测器（用校准后的阈值）
+        # ② 初始化发言预测器
         threshold = self._vad.threshold
         self._pre_speech = PreSpeechDetector(
-            noise_threshold=threshold / 3.0,  # 底噪阈值 = 人声阈值 / 3
+            noise_threshold=threshold / 3.0,
             voice_threshold=threshold,
             frame_duration=self._vad.frame_duration,
         )
 
+        # ③ 启动话题白名单采集（并行，前 3 分钟）
+        self._topic_mgr.start_calibration()
+
+        # ④ 启动声学基线采集（并行）
+        self._calibrator.start_calibration()
+
+        # ⑤ 初始化并启动系统音频捕获（v5.3 双通道监听）
+        if self._sys_audio_enabled:
+            self._sys_audio = SystemAudioCapturer(
+                sample_rate=SAMPLE_RATE,
+                buffer_secs=SYSTEM_AUDIO_BUFFER_SECS,
+            )
+            if self._sys_audio.available:
+                ok = self._sys_audio.start()
+                if ok:
+                    self._sys_asr = SystemASRProcessor(asr=self._asr)
+                    print("[Guardian] 系统音频双通道监听已启动（需管理员权限）")
+                else:
+                    print("[Guardian] 系统音频启动失败，回退到单麦克风模式")
+                    self._sys_audio = None
+                    self._sys_asr = None
+            else:
+                print("[Guardian] 系统音频设备不可用，回退到单麦克风模式")
+                print("[Guardian] 提示: 安装 sounddevice 并以管理员权限运行可启用双通道监听")
+                self._sys_audio = None
+                self._sys_asr = None
+
         self._running = True
-        self._thread = threading.Thread(
-            target=self._listen_loop,
-            daemon=True,
-        )
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
-        print("[Guardian] 守护线程已启动，后台监听中...")
+        print(f"[Guardian] 守护线程已启动，开场 {TOPIC_CALIBRATE_SECS:.0f}s 采集会议话题白名单中...")
 
     def stop(self) -> None:
         """停止守护监听并释放资源"""
@@ -123,28 +203,33 @@ class MicGuardian:
             self._thread.join(timeout=2.0)
             self._thread = None
         self._vad.close()
+        # 停止系统音频捕获
+        if self._sys_audio is not None:
+            self._sys_audio.stop()
+            self._sys_audio = None
+            self._sys_asr = None
         print("[Guardian] 守护线程已停止")
 
     # ------------------------------------------------------------------
     # 主监听循环
     # ------------------------------------------------------------------
     def _listen_loop(self) -> None:
-        """后台监听主循环（含全链路异常捕获 + 内存监控）"""
+        """后台监听主循环（v5.0：闲聊检测 + 话题分类）"""
         self._vad.open()
-        frame_duration = self._vad.frame_duration  # 单帧耗时（秒）
-        _mem_check_timer: float = 0.0  # 内存检测定时器
+        frame_duration = self._vad.frame_duration
+        # 连续语音帧累积（用于 ASR 分段）
+        _voice_segment_frames: int = 0
+        _voice_segment_start: float = 0.0
 
         while self._running:
             try:
                 state, energy = self._vad.detect_frame()
             except OSError as e:
-                # 硬件异常（设备占用/拔出）
                 from error_handler import handle_hardware_error
                 handle_hardware_error(e)
                 state, energy = "silence", 0.0
                 self._frame_error_count += 1
                 if self._frame_error_count >= MAX_FRAME_ERRORS:
-                    print("[Guardian] 连续帧错误过多，尝试重置音频流")
                     self._restart_vad_stream()
                     self._frame_error_count = 0
                 continue
@@ -152,155 +237,231 @@ class MicGuardian:
                 state, energy = handle_audio_frame_error(e)
                 self._frame_error_count += 1
                 if self._frame_error_count >= MAX_FRAME_ERRORS:
-                    print("[Guardian] 连续帧错误过多，尝试重置音频流")
                     self._restart_vad_stream()
                     self._frame_error_count = 0
                 continue
             else:
-                self._frame_error_count = 0  # 成功读帧，重置错误计数
+                self._frame_error_count = 0
 
-            # 定时检查内存占用（每 STRESS_LOG_INTERVAL_S 秒一次）
-            _mem_check_timer += frame_duration
-            if _mem_check_timer >= STRESS_LOG_INTERVAL_S:
-                _mem_check_timer = 0.0
-                check_memory_usage(cleanup_callback=self._clear_audio_cache)
+            # ---- 步骤 1：麦克风关闭状态（休眠模式） ----
+            if state == "mic_off":
+                if not self._mic_off_flag:
+                    self._mic_off_flag = True
+                    print("[Guardian] 麦克风已关闭，守护进入休眠模式")
+                    # 重置所有计时器和检测状态
+                    self._reset_chitchat_timer()
+                    self._reset_silent_timer()
+                    self.silent_time = 0.0
+                    self.wait_flag = False
+                    self.delay_cnt = 0.0
+                    if self._pre_speech is not None:
+                        self._pre_speech.reset()
+                # 休眠期间：不更新声学特征、不更新发言预测、不做任何检测
+                continue
+            else:
+                # 麦克风从关闭恢复到开启
+                if self._mic_off_flag:
+                    self._mic_off_flag = False
+                    print("[Guardian] 麦克风已开启，守护恢复监听")
+                    self._had_voice_before_off = False
+                    if self._pre_speech is not None:
+                        self._pre_speech.reset()
+                    self._reset_silent_timer()
 
-            # ---- 步骤 1：发言预测更新（每帧） ----
+            # ---- 步骤 2：发言预测更新（每帧） ----
             if self._pre_speech is not None:
                 self._pre_speech.update_audio(energy)
                 self._pre_speech.tick()
-                if self._pre_speech.should_reset:
-                    status = self._pre_speech.status_str
-                    print(f"[Guardian] 发言预测命中（{status}），提前清零计时器")
-                    self._reset_cycle()
-                    self._pre_speech.reset_semantic()
-                    continue
 
-            # ---- 步骤 2：手动关麦处理（动态屏蔽逻辑） ----
-            if state == "mic_off":
-                if not self._mic_off_flag:
-                    # 判断：误关麦 vs 主动闭麦
-                    if self._had_voice_before_off and not self._should_block_mic_off_alert():
-                        # 此前连续有人声 → 误关麦 → 即时弹窗
-                        print("[Guardian] 检测到麦克风被手动关闭（此前连续人声 → 误关麦）")
-                        show_mic_off_alert()
-                    else:
-                        # 主动闭麦 → 动态屏蔽弹窗
-                        block_reason = "主动闭麦（NLP 休息意图）" if self._should_block_mic_off_alert() else "主动闭麦（无人声前兆）"
-                        print(f"[Guardian] 检测到麦克风被手动关闭（{block_reason}），已屏蔽弹窗")
-                    self._mic_off_flag = True
-                    self._reset_cycle()
-                continue
-            else:
-                # 关麦状态恢复 → 解除屏蔽，回归常规
-                if self._mic_off_flag:
-                    print("[Guardian] 麦克风已恢复，解除屏蔽状态，回归常规监听")
-                    self._mic_off_flag = False
-                    self._had_voice_before_off = False
+            # ---- 步骤 3：声学特征每帧更新（供 UI 展示） ----
+            # 校准期间只传递 voice 帧，避免静音帧污染「发言基线」
+            self._calibrator.feed_frame(energy, is_voice=(state == "voice"))
 
-            # ---- 步骤 3：检测到人声 → 重置计时 + 更新语音历史 ----
+            # ---- 步骤 3：检测到人声帧 ----
             if state == "voice":
                 self._voice_streak += 1
-                # 连续若干帧有人声，标记"此前有人声记录"
                 if self._voice_streak >= 3:
                     self._had_voice_before_off = True
-                if self.silent_time > 0 or self.wait_flag:
-                    print(f"[Guardian] 检测到人声（能量={energy:.1f}），计时器重置")
-                self._reset_cycle()
-                continue
-            else:
-                # 非 voice 帧 → 中断连续人声记录
-                self._voice_streak = 0
+                # 有声音输入，重置安静计时器
+                self._reset_silent_timer()
 
-            # ---- 步骤 4：静音帧 → 累加计时 ----
-            # state == "silence"
-            self.silent_time += frame_duration
+                # ASR 语音验证（防噪音误判）
+                if self._voice_verify_enabled:
+                    if not self._in_verify_window:
+                        self._in_verify_window = True
+                        self._verify_buffer = [
+                            self._vad._audio_buffer[-1] if self._vad._audio_buffer else b""
+                        ]
+                        self._voice_confirmed = False
+                        continue
+                    else:
+                        self._verify_buffer.append(
+                            self._vad._audio_buffer[-1] if self._vad._audio_buffer else b""
+                        )
+                        if len(self._verify_buffer) >= self._verify_frames_needed:
+                            pcm = b"".join(self._verify_buffer)
+                            is_speech = self._asr.verify_speech(pcm, min_text_len=MIN_VOICE_TEXT_LEN)
+                            self._in_verify_window = False
+                            self._verify_buffer = []
 
-            # 延时等待阶段
-            if self.wait_flag:
-                self.delay_cnt -= frame_duration
-                if self.delay_cnt <= 0:
-                    print("[Guardian] 延时结束，触发 ASR+NLP 流程...")
-                    self._run_asr_nlp_pipeline()
-                continue
+                            if is_speech:
+                                self._voice_confirmed = True
+                                # ---- 步骤 4：ASR 转写 + 话题分类 ----
+                                self._run_topic_classification()
+                            else:
+                                self._voice_confirmed = False
+                        continue
 
-            # 静默达到阈值，进入延时等待（若已判定主动下线则跳过）
-            if self.silent_time >= SILENT_THRESHOLD_S:
-                if self._stop_remind:
-                    self.silent_time = 0.0
+                else:
+                    # 关闭验证：直接 ASR
+                    self._run_topic_classification()
                     continue
-                print(f"[Guardian] 连续静音 {self.silent_time:.1f}s，进入 {DELAY_WAIT_S:.0f}s 延时等待")
-                self.wait_flag = True
-                self.delay_cnt = DELAY_WAIT_S
+
+            else:
+                # 能量回落（非 voice / silence）
+                self._voice_streak = 0
+                if self._in_verify_window:
+                    self._in_verify_window = False
+                    self._verify_buffer = []
+                    self._voice_confirmed = False
+
+                # 静默/NEUTRAL：累加非闲聊计时
+                self._non_chitchat_timer += frame_duration
+                if self._non_chitchat_timer >= CHITCHAT_RESET_SECS and self._chitchat_timer > 0:
+                    print(f"[Guardian] 连续非闲聊 {self._non_chitchat_timer:.1f}s，重置闲聊计时")
+                    self._reset_chitchat_timer()
+
+                # ---- 步骤 X：系统音频 ASR 处理（v5.3 双通道监听） ----
+                self._process_system_audio()
+
+                # 累加安静计时器（麦克风开启但无有效输入）
+                self._silent_timer += frame_duration
+                # 安静达到阈值 → 弹窗提醒关麦（系统音频会议状态下不弹窗）
+                if self._silent_timer >= SILENT_ALERT_SECS and not self._silent_alerted:
+                    sys_state = self._get_system_meeting_state()
+                    if sys_state == MeetingState.MY_TURN:
+                        print(f"[Guardian] 安静 {self._silent_timer:.1f}s，但轮到用户发言 → 跳过弹窗")
+                        self._reset_silent_timer()
+                    elif sys_state == MeetingState.LISTENING:
+                        print(f"[Guardian] 安静 {self._silent_timer:.1f}s，但其他人在说话 → 跳过弹窗")
+                        self._reset_silent_timer()
+                    elif not self._stop_remind:
+                        print(f"[Guardian] 安静 {self._silent_timer:.1f}s 无有效输入 → 弹窗提醒关麦")
+                        show_silent_alert(
+                            message=f"提醒：麦克风已开启 {self._silent_timer:.0f} 秒\n未检测到发言，建议关闭麦克风"
+                        )
+                        self._silent_alerted = True
 
     # ------------------------------------------------------------------
-    # ASR + NLP 联动管道
+    # 话题分类流程（ASR → topic → 计时器更新）
     # ------------------------------------------------------------------
-    def _run_asr_nlp_pipeline(self) -> None:
+    def _run_topic_classification(self) -> None:
         """
-        弹窗触发后执行：截取音频 → ASR → NLP → 根据意图调整提醒策略
+        截取近 ASR_CAPTURE_SECS 音频 → ASR → 话题分类（MEETING/CHITCHAT/NEUTRAL）
+        根据分类结果更新闲聊计时器，达到阈值则弹窗提醒。
         """
-        # 1. 弹窗提醒
-        show_silent_alert()
-
-        # 2. 截取静音前 3s 音频
         pcm_data = self._vad.get_recent_pcm(duration_secs=ASR_CAPTURE_SECS)
         if not pcm_data:
-            print("[Guardian] 音频缓冲区为空，跳过 ASR")
-            self._reset_cycle()
             return
 
-        # 3. 离线 ASR 识别（含异常捕获）
         recognized_text = ""
         if self._asr.available:
-            print("[Guardian] 正在进行离线语音识别...")
             try:
                 recognized_text = self._asr.recognize_pcm(pcm_data)
             except Exception as e:
-                recognized_text = handle_asr_error(e, context="recognize_pcm")
+                recognized_text = handle_asr_error(e, context="classify_pcm")
+        else:
+            return  # ASR 不可用则无法分类
+
+        if not recognized_text:
+            return
+
+        # 校准阶段：喂给话题管理器，不分类
+        if self._topic_mgr.is_calibrating:
+            self._topic_mgr.feed_text(recognized_text)
+            print(f'[Guardian][校准] 采集话题文本: "{recognized_text}"')
+            remaining = self._topic_mgr.calibrate_remaining
+            if remaining <= 0:
+                self._topic_mgr.force_end_calibration()
+            return
+
+        # 正式阶段：三重校验分类
+        detail = self._topic_mgr.classify_with_reason(recognized_text)
+        content_type: ContentType = detail["type"]
+
+        with self._state_lock:
+            self._last_content_type = content_type
+            self._last_classify_detail = detail
+
+        # 声学辅助评分
+        acoustic_score, acoustic_detail = self._calibrator.evaluate()
+
+        if content_type == ContentType.MEETING:
+            # 命中会议白名单 → 正常发言，重置闲聊计时和安静计时
+            wl_hits = detail.get("matched_whitelist", [])
+            print(f'[Guardian] 会议发言（命中白名单: {wl_hits[:3]}）: "{recognized_text}"')
+            self._reset_chitchat_timer()
+            self._reset_silent_timer()
+
+        elif content_type == ContentType.CHITCHAT:
+            # 命中闲聊词库 → 累加闲聊计时
+            cc_hits = detail.get("matched_chitchat", [])
+            segment_dur = min(ASR_CAPTURE_SECS, len(pcm_data) / (SAMPLE_RATE * 2))
+            self._chitchat_timer += segment_dur
+            self._non_chitchat_timer = 0.0  # 重置非闲聊计时
+            self._reset_silent_timer()       # 有声音输入，重置安静计时
+
+            acou_note = f" 声学:{acoustic_detail.get('score','?')}" if acoustic_detail else ""
+            print(f'[Guardian] 闲聊内容（{self._chitchat_timer:.1f}s/{CHITCHAT_ALERT_SECS}s'
+                  f'，命中词: {cc_hits[:3]}{acou_note}）: "{recognized_text}"')
+
+            # 达到阈值 → 弹窗提醒
+            if self._chitchat_timer >= CHITCHAT_ALERT_SECS and not self._chitchat_alerted:
+                if not self._stop_remind:
+                    print(f"[Guardian] 连续闲聊 {self._chitchat_timer:.1f}s → 弹窗提醒关麦")
+                    show_silent_alert(
+                        message=f"提醒：您已闲聊 {self._chitchat_timer:.0f} 秒\n建议关闭麦克风，避免打扰会议"
+                    )
+                    self._chitchat_alerted = True
+                    self._last_chitchat_text = recognized_text
+
+        else:
+            # NEUTRAL：没有检测到有效发言（安静或听别人说话）
+            print(f'[Guardian] 中性内容（NEUTRAL）: "{recognized_text}"')
+            # 轻微累加非闲聊计时
+            self._non_chitchat_timer += min(ASR_CAPTURE_SECS, 1.0)
+            # 重置闲聊计时器（安静时不算闲聊）
+            self._chitchat_timer = 0.0
+            self._chitchat_alerted = False
+
+    # ------------------------------------------------------------------
+    # ASR 联动管道（旧版弹窗流程，保留兼容 CLI 的 a/asr 命令）
+    # ------------------------------------------------------------------
+    def _run_asr_nlp_pipeline(self) -> None:
+        """CLI 手动触发：截取音频 → ASR → 展示结果"""
+        show_silent_alert()
+        pcm_data = self._vad.get_recent_pcm(duration_secs=ASR_CAPTURE_SECS)
+        if not pcm_data:
+            print("[Guardian] 音频缓冲区为空，跳过 ASR")
+            return
+        recognized_text = ""
+        if self._asr.available:
+            try:
+                recognized_text = self._asr.recognize_pcm(pcm_data)
+            except Exception as e:
+                recognized_text = handle_asr_error(e, context="manual_asr")
             if recognized_text:
                 print(f'[Guardian] ASR 结果: "{recognized_text}"')
-            else:
-                print("[Guardian] ASR 未识别到有效语音")
-        else:
-            print("[Guardian] ASR 不可用，跳过语音识别")
-
-        # 4. NLP 意图匹配
         if recognized_text:
-            intent_result = self._nlp.match(recognized_text)
-            if intent_result:
-                self._last_intent = intent_result
-                intent = intent_result["intent"]
-                action = intent_result["action"]
-                score = intent_result["score"]
-                keyword = intent_result["matched_keyword"]
-                print(f"[Guardian] NLP 命中意图: {intent}（匹配关键词: {keyword}, 相似度: {score}）")
+            detail = self._topic_mgr.classify_with_reason(recognized_text)
+            print(f"[Guardian] 话题分类: {detail['type'].value}，"
+                  f"白名单命中: {detail.get('matched_whitelist', [])}，"
+                  f"闲聊命中: {detail.get('matched_chitchat', [])}")
 
-                # 4.1 发言预测：将意图结果传递给 pre_speech
-                if self._pre_speech is not None:
-                    self._pre_speech.update_nlp(intent_result)
-
-                if action == "stop_remind":
-                    print("[Guardian] 判定用户主动下线，后续不再弹窗提醒")
-                    self._stop_remind = True
-                elif action == "reset_timer":
-                    print("[Guardian] 判定用户准备发言，重置计时器")
-                    self._reset_cycle()
-                    return
-                elif action == "mark_ready":
-                    print("[Guardian] 判定用户铺垫/提问，标记即将发言状态")
-                elif action == "block_alert":
-                    print("[Guardian] 判定用户主动休息，后续关麦将屏蔽弹窗")
-            else:
-                print("[Guardian] NLP 未命中任何意图，按默认逻辑处理")
-        else:
-            print("[Guardian] 无识别文本，按默认逻辑处理")
-
-        # 5. 无论结果如何，重置本次静默周期计时器
-        self._reset_cycle()
-
+    # ------------------------------------------------------------------
+    # 辅助方法
+    # ------------------------------------------------------------------
     def _restart_vad_stream(self) -> None:
-        """重置 VAD 音频流（用于连续帧错误后的恢复）"""
         try:
             self._vad.close()
             time.sleep(0.2)
@@ -311,31 +472,71 @@ class MicGuardian:
             handle_hardware_error(e)
 
     def _clear_audio_cache(self) -> None:
-        """清理 VAD 音频滚动缓冲区（内存超限时调用）"""
         try:
             self._vad._audio_buffer.clear()
-            print("[Guardian] 音频滚动缓冲区已清理（内存压力释放）")
+            print("[Guardian] 音频滚动缓冲区已清理")
         except Exception:
             pass
 
-    def _should_block_mic_off_alert(self) -> bool:
+    def _reset_chitchat_timer(self) -> None:
+        """重置闲聊计时器和弹窗状态"""
+        with self._state_lock:
+            self._chitchat_timer = 0.0
+            self._chitchat_alerted = False
+            self._non_chitchat_timer = 0.0
+
+    def _reset_silent_timer(self) -> None:
+        """重置安静计时器和弹窗状态（检测到有效声音输入时调用）"""
+        with self._state_lock:
+            self._silent_timer = 0.0
+            self._silent_alerted = False
+
+    # ------------------------------------------------------------------
+    # 系统音频处理（v5.3 双通道监听）
+    # ------------------------------------------------------------------
+    def _process_system_audio(self) -> None:
         """
-        判断当前是否应该屏蔽麦克风关闭弹窗。
-        条件：NLP 最近命中离场/休息类意图（block_alert）。
+        定期处理系统音频：ASR 识别 + 会议状态判断。
+        在 _listen_loop 的每帧 silence/NEUTRAL 时调用。
         """
-        if self._last_intent is None:
-            return False
-        return self._last_intent.get("action") == "block_alert"
+        if self._sys_audio is None or self._sys_asr is None:
+            return
+        if not self._sys_audio.is_running:
+            return
+
+        now = time.time()
+        if now - self._sys_asr_last_time < SYSTEM_ASR_INTERVAL_SECS:
+            return  # 未到处理间隔
+
+        self._sys_asr_last_time = now
+        pcm = self._sys_audio.get_recent_pcm(duration_secs=ASR_CAPTURE_SECS)
+        if pcm and len(pcm) > 1000:
+            state = self._sys_asr.process(pcm)
+            if state == MeetingState.MY_TURN:
+                # 轮到用户发言 → 重置安静计时器
+                self._reset_silent_timer()
+            elif state == MeetingState.LISTENING:
+                # 其他人在说话 → 用户在听 → 也重置安静计时器
+                self._reset_silent_timer()
+
+    def _get_system_meeting_state(self) -> MeetingState:
+        """
+        获取当前系统音频检测到的会议状态。
+        :return: MeetingState
+        """
+        if self._sys_asr is None:
+            return MeetingState.UNKNOWN
+        return self._sys_asr.state
 
     def _reset_cycle(self) -> None:
-        """重置当前静默周期计时器（线程安全）"""
+        """旧版计时器重置（兼容 CLI 查询）"""
         with self._state_lock:
             self.silent_time = 0.0
             self.wait_flag = False
             self.delay_cnt = 0.0
 
     # ------------------------------------------------------------------
-    # 状态查询（供外部 UI / CLI 展示）
+    # 状态查询
     # ------------------------------------------------------------------
     @property
     def is_running(self) -> bool:
@@ -346,20 +547,10 @@ class MicGuardian:
         return self._vad.threshold
 
     @property
-    def last_intent(self) -> Optional[dict]:
-        """上次识别的 NLP 意图结果"""
-        return self._last_intent
-
-    @property
     def pre_speech_status(self) -> dict:
-        """发言预测模块当前状态（供 CLI/UI 展示）"""
         if self._pre_speech is None:
-            return {
-                "pre_voice": False,
-                "semantic_ready": False,
-                "should_reset": False,
-                "status_str": "未初始化",
-            }
+            return {"pre_voice": False, "semantic_ready": False,
+                    "should_reset": False, "status_str": "未初始化"}
         return {
             "pre_voice": self._pre_speech.is_pre_voice,
             "semantic_ready": self._pre_speech.is_semantic_ready,
@@ -369,20 +560,91 @@ class MicGuardian:
 
     @property
     def block_status(self) -> dict:
-        """关麦屏蔽动态状态"""
         return {
             "stop_remind": self._stop_remind,
             "mic_off_flag": self._mic_off_flag,
             "had_voice_before_off": self._had_voice_before_off,
-            "block_alert": self._should_block_mic_off_alert(),
+            "block_alert": False,
         }
 
     @property
-    def error_summary(self) -> dict:
-        """各类异常计数摘要（供 CLI/压测报告使用）"""
+    def chitchat_status(self) -> dict:
+        """闲聊检测当前状态（供 CLI/UI 展示）"""
+        return {
+            "timer": round(self._chitchat_timer, 1),
+            "alert_threshold": CHITCHAT_ALERT_SECS,
+            "alerted": self._chitchat_alerted,
+            "non_chitchat_timer": round(self._non_chitchat_timer, 1),
+            "reset_threshold": CHITCHAT_RESET_SECS,
+            "last_text": self._last_chitchat_text,
+            "last_content_type": (
+                self._last_content_type.value if self._last_content_type else "无"
+            ),
+        }
+
+    @property
+    def topic_status(self) -> dict:
+        """话题白名单状态（供 CLI/UI 展示）"""
+        stats = self._topic_mgr.stats
+        return {
+            "is_calibrating": stats["is_calibrating"],
+            "is_calibrated": stats["is_calibrated"],
+            "calibrate_remaining": round(stats["calibrate_remaining"], 1),
+            "whitelist_size": stats["whitelist_size"],
+            "top_words": self._topic_mgr.whitelist_words[:10],
+            "meeting_count": stats["meeting"],
+            "chitchat_count": stats["chitchat"],
+            "neutral_count": stats["neutral"],
+        }
+
+    @property
+    def acoustic_status(self) -> dict:
+        """声学特征当前状态（供 CLI/UI 展示）"""
+        score, detail = self._calibrator.evaluate()
+        return {
+            "is_calibrated": self._calibrator.is_calibrated,
+            "calibrate_progress": round(self._calibrator.calibrate_progress * 100, 1),
+            "baseline_mean": round(self._calibrator.baseline_mean, 1),
+            "baseline_cv": round(self._calibrator.baseline_cv, 3),
+            "current_score": detail.get("score", "mid"),
+            "current_cv": detail.get("cv", 0.0),
+            "current_mean": detail.get("mean", 0.0),
+            "reason": detail.get("reason", ""),
+        }
+
+    @property
+    def error_summary(self) -> str:
         return get_error_log().summary()
 
     @property
     def recent_errors(self) -> list:
-        """最近 10 条错误记录"""
         return get_error_log().recent(10)
+
+    @property
+    def system_audio_status(self) -> dict:
+        """系统音频状态（供 CLI/UI 展示）"""
+        if self._sys_asr is None:
+            return {
+                "available": False,
+                "device_name": self._sys_audio.device_name if self._sys_audio else "未初始化",
+                "state": "unknown",
+                "is_my_turn": False,
+                "is_listening": False,
+                "is_idle": False,
+                "last_text": "",
+                "last_matched_keyword": "",
+            }
+        s = self._sys_asr.status
+        return {
+            "available": True,
+            "device_name": self._sys_audio.device_name if self._sys_audio else "未知",
+            "state": s["state"],
+            "is_my_turn": s["is_my_turn"],
+            "is_listening": s["is_listening"],
+            "is_idle": s["is_idle"],
+            "my_turn_remaining": s["my_turn_remaining"],
+            "last_text": s["last_text"],
+            "last_matched_keyword": s["last_matched_keyword"],
+            "asr_available": s["asr_available"],
+        }
+

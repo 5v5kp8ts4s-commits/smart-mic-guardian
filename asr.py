@@ -22,11 +22,8 @@ except ImportError:
     Model = None
     KaldiRecognizer = None
 
-# 模型存放路径（用户需提前下载）
-MODEL_DIR = Path(__file__).parent / "model"
-
-# 备选模型路径（支持环境变量覆盖）
-VOSK_MODEL_PATH = os.environ.get("VOSK_MODEL_PATH", str(MODEL_DIR))
+# 统一从 config 引入路径和采样率参数
+from config import VOSK_MODEL_PATH, MODEL_DIR, SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 
 
 def _ensure_model() -> Optional[str]:
@@ -54,7 +51,7 @@ class OfflineASR:
     离线语音识别器（基于 vosk）
     """
 
-    def __init__(self, sample_rate: int = 16000):
+    def __init__(self, sample_rate: int = _DEFAULT_SAMPLE_RATE):
         self.sample_rate = sample_rate
         self._model_path: Optional[str] = _ensure_model()
         self._recognizer = None
@@ -129,6 +126,31 @@ class OfflineASR:
         except Exception as e:
             print(f"[ASR] 文件识别异常: {e}")
             return ""
+
+    # ------------------------------------------------------------------
+    # 快速语音验证（用于噪音过滤：咳嗽/键盘/走动不触发重置）
+    # ------------------------------------------------------------------
+    def verify_speech(self, pcm_bytes: bytes, min_text_len: int = 1) -> bool:
+        """
+        快速验证一段音频是否包含可识别的语音（自然语言）。
+        与 recognize_pcm 的区别：只返回 True/False，不做完整文本输出。
+        :param pcm_bytes: 原始 PCM 数据
+        :param min_text_len: 识别文本最小有效长度
+        :return: True 确认为人声（识别出有效文本），False 为噪音/无语音
+        """
+        if not self.available:
+            # ASR 不可用时回退到能量判定（无法做噪音过滤）
+            return True
+
+        try:
+            self._recognizer.AcceptWaveform(pcm_bytes)
+            result = json.loads(self._recognizer.FinalResult())
+            text = result.get("text", "").strip()
+            self._reset_recognizer()
+            return len(text) >= min_text_len
+        except Exception as e:
+            print(f"[ASR] 语音验证异常: {e}")
+            return True  # 异常时保守处理，视为人声
 
     # ------------------------------------------------------------------
     # 内部辅助

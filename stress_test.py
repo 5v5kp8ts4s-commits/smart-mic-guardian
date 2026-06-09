@@ -414,9 +414,7 @@ def run_stress_test(hours: float = 72.0, use_real_mic: bool = False) -> StressSt
             guardian._pre_speech       = None
 
             from asr import OfflineASR
-            from nlp import IntentMatcher
             guardian._asr = OfflineASR(sample_rate=SAMPLE_RATE)
-            guardian._nlp = IntentMatcher()
         except Exception as e:
             print(f"[压测] Guardian 初始化失败（模拟模式）: {e}")
             guardian = None
